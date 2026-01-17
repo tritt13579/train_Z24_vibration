@@ -1,0 +1,30 @@
+{
+  "run_group": "noise_and_scale",
+  "version": "v2",
+  "classes": [
+    "01",
+    "03",
+    "04",
+    "05",
+    "06"
+  ],
+  "batch_size": 64,
+  "epochs": 150,
+  "learning_rate": 0.0005,
+  "num_filters": 128,
+  "kernel_size": 3,
+  "number_of_blocks": 4,
+  "residuals_per_block": 10,
+  "downsample_factor": 1,
+  "pool_type": "avg",
+  "dropout": 0.3,
+  "weight_decay": 0.0001,
+  "num_workers": 4,
+  "scaling_p": 0.7,
+  "scale_min": 0.9,
+  "scale_max": 1.1,
+  "noise_p": 0.5,
+  "noise_std_ratio": 0.01,
+  "split_seed": 42,
+  "global_seed": 4
+}
