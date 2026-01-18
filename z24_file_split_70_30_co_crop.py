@@ -2,10 +2,11 @@
 import os
 import random
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import scipy.io
+from scipy.signal import resample
 import torch
 from torch.utils.data import Dataset, DataLoader
 
@@ -29,8 +30,11 @@ class Z24Cfg:
     return_ct: bool = True
 
     # augmentation (paper-style)
-    # 3 noisy variants per window
+    # Create 3 noisy variants per window with k in [0.03, 0.05, 0.07]
     noise_ks: tuple = (0.03, 0.05, 0.07)
+
+    crop_ratio_min: float = 0.85
+    crop_ratio_max: float = 0.95
 
 
 # =========================
@@ -59,8 +63,8 @@ def _load_window(fp: str, start: int, cfg: Z24Cfg) -> np.ndarray:
     mat = scipy.io.loadmat(fp)
     if cfg.key not in mat:
         raise KeyError(f"Missing key '{cfg.key}' in {fp}")
-
     x = np.asarray(mat[cfg.key])  # (T,C)
+
     end = start + cfg.window
     w = x[start:end, :]
     return w.astype(np.float32)
@@ -75,6 +79,11 @@ def _split_files_70_30(files: List[str], rng: random.Random):
 
 
 def _mean_std_from_train(train_index, cfg: Z24Cfg):
+    """
+    train_index contains (fp, y, start, aug_type)
+    We compute mean/std from TRAIN windows (clean only) for stability.
+    (Augmented variants are derived from the same windows.)
+    """
     sum_c = np.zeros((cfg.channels,), dtype=np.float64)
     sumsq_c = np.zeros((cfg.channels,), dtype=np.float64)
     count = 0
@@ -90,7 +99,6 @@ def _mean_std_from_train(train_index, cfg: Z24Cfg):
     mean = sum_c / max(count, 1)
     var = sumsq_c / max(count, 1) - mean * mean
     std = np.sqrt(np.maximum(var, 0.0))
-
     return mean.astype(np.float32), std.astype(np.float32)
 
 
@@ -98,11 +106,12 @@ def _mean_std_from_train(train_index, cfg: Z24Cfg):
 # DATASET
 # =========================
 class Z24Windows(Dataset):
-    def __init__(self, index, cfg: Z24Cfg, mean=None, std=None):
+    def __init__(self, index, cfg: Z24Cfg, mean=None, std=None, is_train=False):
         self.index = index  # (fp, y, start, aug_type)
         self.cfg = cfg
         self.mean = mean
         self.std = std
+        self.is_train = is_train
 
         if cfg.normalize and (mean is None or std is None):
             raise ValueError("normalize=True requires mean/std computed from TRAIN")
@@ -110,13 +119,29 @@ class Z24Windows(Dataset):
     def __len__(self):
         return len(self.index)
 
+    def _crop_and_resample(self, w: np.ndarray):
+        T = w.shape[0]
+        ratio = random.uniform(self.cfg.crop_ratio_min, self.cfg.crop_ratio_max)
+        crop_len = max(2, int(T * ratio))  # ensure >=2
+
+        start = random.randint(0, T - crop_len)
+        cropped = w[start:start + crop_len, :]
+
+        resized = resample(cropped, T, axis=0)
+        return resized.astype(np.float32)
+
     def __getitem__(self, i):
         fp, y, s, aug_type = self.index[i]
         w = _load_window(fp, s, self.cfg)  # (T,C)
 
-        # ---- augmentation ----
+        # ---- augment (TRAIN index only; VAL uses clean only) ----
         if aug_type.startswith("noise_"):
-            k = float(aug_type.split("_", 1)[1])
+            # aug_type = "noise_0.03" / "noise_0.05" / "noise_0.07"
+            try:
+                k = float(aug_type.split("_", 1)[1])
+            except Exception as e:
+                raise ValueError(f"Bad aug_type for noise: {aug_type}") from e
+
             noise = np.random.normal(
                 0.0,
                 k * self.std[None, :],
@@ -126,6 +151,9 @@ class Z24Windows(Dataset):
 
         elif aug_type == "reverse":
             w = w[::-1]
+
+        elif aug_type == "crop":
+            w = self._crop_and_resample(w)
 
         elif aug_type == "clean":
             pass
@@ -154,10 +182,13 @@ def _build_index(files_with_label, cfg: Z24Cfg, augment: bool):
             if augment:
                 index.append((fp, y, s, "clean"))
 
+                # 3 noisy variants
                 for k in cfg.noise_ks:
                     index.append((fp, y, s, f"noise_{k:.2f}"))
 
+                # reverse + crop
                 index.append((fp, y, s, "reverse"))
+                index.append((fp, y, s, "crop"))
             else:
                 index.append((fp, y, s, "clean"))
 
@@ -176,13 +207,15 @@ def make_loaders(classes, cfg: Z24Cfg, batch_size=32, num_workers=0):
         tr_files += [(fp, y) for fp in tr]
         va_files += [(fp, y) for fp in va]
 
+    # build indices
     tr_index = _build_index(tr_files, cfg, augment=True)
     va_index = _build_index(va_files, cfg, augment=False)
 
+    # compute mean/std from TRAIN clean windows only
     mean, std = _mean_std_from_train(tr_index, cfg)
 
-    tr_ds = Z24Windows(tr_index, cfg, mean, std)
-    va_ds = Z24Windows(va_index, cfg, mean, std)
+    tr_ds = Z24Windows(tr_index, cfg, mean, std, is_train=True)
+    va_ds = Z24Windows(va_index, cfg, mean, std, is_train=False)
 
     tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     va_loader = DataLoader(va_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)

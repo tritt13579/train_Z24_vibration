@@ -2,7 +2,7 @@
 import os
 import random
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import scipy.io
@@ -10,9 +10,6 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 
-# =========================
-# CONFIG
-# =========================
 @dataclass
 class Z24Cfg:
     root: str = "./DatasetPDT"
@@ -22,23 +19,17 @@ class Z24Cfg:
     channels: int = 5
     end_t: int = 64000
     window: int = 2048
+    gap: int = 256          # step = window + gap = 10000
     seed: int = 42
 
     normalize: bool = True
     eps: float = 1e-8
-    return_ct: bool = True
-
-    # augmentation (paper-style)
-    # 3 noisy variants per window
-    noise_ks: tuple = (0.03, 0.05, 0.07)
+    return_ct: bool = True   # True: (C,T), False: (T,C)
 
 
-# =========================
-# UTIL
-# =========================
 def _starts(cfg: Z24Cfg) -> List[int]:
-    # non-overlapping windows, drop last if incomplete
-    return list(range(0, cfg.end_t - cfg.window + 1, cfg.window))
+    step = cfg.window + cfg.gap
+    return list(range(0, cfg.end_t - cfg.window + 1, step))
 
 
 def _class_dir(cfg: Z24Cfg, cls: str) -> str:
@@ -58,31 +49,54 @@ def _list_mat_files(cfg: Z24Cfg, cls: str) -> List[str]:
 def _load_window(fp: str, start: int, cfg: Z24Cfg) -> np.ndarray:
     mat = scipy.io.loadmat(fp)
     if cfg.key not in mat:
-        raise KeyError(f"Missing key '{cfg.key}' in {fp}")
+        raise KeyError(f"Missing key '{cfg.key}' in {fp}. keys={list(mat.keys())}")
 
-    x = np.asarray(mat[cfg.key])  # (T,C)
+    x = np.asarray(mat[cfg.key])  # expected (T,C)
+    if x.ndim != 2:
+        raise ValueError(f"{fp}: expected 2D, got {x.shape}")
+    if x.shape[1] != cfg.channels:
+        raise ValueError(f"{fp}: expected C={cfg.channels}, got {x.shape[1]}")
+    if x.shape[0] < cfg.end_t:
+        raise ValueError(f"{fp}: T={x.shape[0]} < end_t={cfg.end_t}")
+
     end = start + cfg.window
-    w = x[start:end, :]
+    if end > cfg.end_t:
+        raise ValueError(f"{fp}: window end {end} > end_t {cfg.end_t}")
+    if end > x.shape[0]:
+        raise ValueError(f"{fp}: window end {end} > T {x.shape[0]}")
+
+    w = x[start:end, :]  # (window,C)
     return w.astype(np.float32)
 
 
-def _split_files_70_30(files: List[str], rng: random.Random):
+def _split_files_70_30(files: List[str], rng: random.Random) -> Tuple[List[str], List[str]]:
+    # ensure non-empty both sets
+    n = len(files)
+    if n < 2:
+        raise ValueError(f"Need >=2 files for 70/30 split, got n={n}")
+
     files = files[:]
     rng.shuffle(files)
-    n = len(files)
-    n_train = max(1, min(int(round(0.7 * n)), n - 1))
-    return files[:n_train], files[n_train:]
+
+    n_train = int(round(0.70 * n))
+    n_train = max(1, min(n_train, n - 1))
+    tr = files[:n_train]
+    va = files[n_train:]
+    return tr, va
 
 
-def _mean_std_from_train(train_index, cfg: Z24Cfg):
+def _build_index(files_with_label: List[Tuple[str, int]], cfg: Z24Cfg) -> List[Tuple[str, int, int]]:
+    starts = _starts(cfg)
+    return [(fp, y, s) for fp, y in files_with_label for s in starts]
+
+
+def _mean_std_from_train(train_index: List[Tuple[str, int, int]], cfg: Z24Cfg) -> Tuple[np.ndarray, np.ndarray]:
     sum_c = np.zeros((cfg.channels,), dtype=np.float64)
     sumsq_c = np.zeros((cfg.channels,), dtype=np.float64)
     count = 0
 
-    for fp, _, s, aug_type in train_index:
-        if aug_type != "clean":
-            continue
-        w = _load_window(fp, s, cfg).astype(np.float64)
+    for fp, _, s in train_index:
+        w = _load_window(fp, s, cfg).astype(np.float64)  # (T,C)
         sum_c += w.sum(axis=0)
         sumsq_c += (w * w).sum(axis=0)
         count += w.shape[0]
@@ -90,49 +104,26 @@ def _mean_std_from_train(train_index, cfg: Z24Cfg):
     mean = sum_c / max(count, 1)
     var = sumsq_c / max(count, 1) - mean * mean
     std = np.sqrt(np.maximum(var, 0.0))
-
     return mean.astype(np.float32), std.astype(np.float32)
 
 
-# =========================
-# DATASET
-# =========================
 class Z24Windows(Dataset):
-    def __init__(self, index, cfg: Z24Cfg, mean=None, std=None):
-        self.index = index  # (fp, y, start, aug_type)
+    def __init__(self, index: List[Tuple[str, int, int]], cfg: Z24Cfg,
+                 mean: Optional[np.ndarray] = None, std: Optional[np.ndarray] = None):
+        self.index = index
         self.cfg = cfg
         self.mean = mean
         self.std = std
-
         if cfg.normalize and (mean is None or std is None):
             raise ValueError("normalize=True requires mean/std computed from TRAIN")
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.index)
 
-    def __getitem__(self, i):
-        fp, y, s, aug_type = self.index[i]
+    def __getitem__(self, i: int):
+        fp, y, s = self.index[i]
         w = _load_window(fp, s, self.cfg)  # (T,C)
 
-        # ---- augmentation ----
-        if aug_type.startswith("noise_"):
-            k = float(aug_type.split("_", 1)[1])
-            noise = np.random.normal(
-                0.0,
-                k * self.std[None, :],
-                size=w.shape
-            ).astype(np.float32)
-            w = w + noise
-
-        elif aug_type == "reverse":
-            w = w[::-1]
-
-        elif aug_type == "clean":
-            pass
-        else:
-            raise ValueError(f"Unknown aug_type: {aug_type}")
-
-        # normalize
         if self.cfg.normalize:
             w = (w - self.mean[None, :]) / (self.std[None, :] + self.cfg.eps)
 
@@ -142,47 +133,29 @@ class Z24Windows(Dataset):
         return torch.from_numpy(w), torch.tensor(y, dtype=torch.long)
 
 
-# =========================
-# BUILD LOADERS
-# =========================
-def _build_index(files_with_label, cfg: Z24Cfg, augment: bool):
-    starts = _starts(cfg)
-    index = []
-
-    for fp, y in files_with_label:
-        for s in starts:
-            if augment:
-                index.append((fp, y, s, "clean"))
-
-                for k in cfg.noise_ks:
-                    index.append((fp, y, s, f"noise_{k:.2f}"))
-
-                index.append((fp, y, s, "reverse"))
-            else:
-                index.append((fp, y, s, "clean"))
-
-    return index
-
-
-def make_loaders(classes, cfg: Z24Cfg, batch_size=32, num_workers=0):
+def make_loaders(classes: List[str], cfg: Z24Cfg, batch_size: int = 32, num_workers: int = 0):
     rng = random.Random(cfg.seed)
 
-    tr_files = []
-    va_files = []
+    tr_files: List[Tuple[str, int]] = []
+    va_files: List[Tuple[str, int]] = []
+    per_class = {}
 
     for y, cls in enumerate(classes):
         files = _list_mat_files(cfg, cls)
         tr, va = _split_files_70_30(files, rng)
         tr_files += [(fp, y) for fp in tr]
         va_files += [(fp, y) for fp in va]
+        per_class[cls] = {"files": len(files), "train_files": len(tr), "val_files": len(va)}
 
-    tr_index = _build_index(tr_files, cfg, augment=True)
-    va_index = _build_index(va_files, cfg, augment=False)
+    tr_index = _build_index(tr_files, cfg)
+    va_index = _build_index(va_files, cfg)
 
-    mean, std = _mean_std_from_train(tr_index, cfg)
+    mean = std = None
+    if cfg.normalize:
+        mean, std = _mean_std_from_train(tr_index, cfg)
 
-    tr_ds = Z24Windows(tr_index, cfg, mean, std)
-    va_ds = Z24Windows(va_index, cfg, mean, std)
+    tr_ds = Z24Windows(tr_index, cfg, mean, std) if cfg.normalize else Z24Windows(tr_index, cfg)
+    va_ds = Z24Windows(va_index, cfg, mean, std) if cfg.normalize else Z24Windows(va_index, cfg)
 
     tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     va_loader = DataLoader(va_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
@@ -193,9 +166,8 @@ def make_loaders(classes, cfg: Z24Cfg, batch_size=32, num_workers=0):
         "val_files": len(va_files),
         "train_samples": len(tr_index),
         "val_samples": len(va_index),
+        "per_class": per_class,
         "mean": mean,
         "std": std,
-        "noise_ks": list(cfg.noise_ks),
     }
-
     return tr_loader, va_loader, meta
