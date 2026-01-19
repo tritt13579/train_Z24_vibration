@@ -1,4 +1,4 @@
-# train_resnet1d_z24_file_70_30.py
+# train_tcn_z24_file_70_30.py
 import os
 os.environ["PYTHONHASHSEED"] = "4"
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
@@ -143,46 +143,54 @@ def eval_loop(model, loader, criterion, device):
 
 
 # ============================================================
-# ResNet1D
+# TCN
 # ============================================================
-class BasicBlock1D(nn.Module):
-    expansion = 1
-
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, downsample=None):
+class TemporalBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation, dropout):
         super().__init__()
-        padding = kernel_size // 2
+        padding = (kernel_size - 1) * dilation // 2
         self.conv1 = nn.Conv1d(
-            in_channels, out_channels, kernel_size=kernel_size,
-            stride=stride, padding=padding, bias=False
+            in_channels, out_channels,
+            kernel_size=kernel_size, dilation=dilation,
+            padding=padding, bias=False
         )
         self.bn1 = nn.BatchNorm1d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.drop1 = nn.Dropout(dropout)
+
         self.conv2 = nn.Conv1d(
-            out_channels, out_channels, kernel_size=kernel_size,
-            stride=1, padding=padding, bias=False
+            out_channels, out_channels,
+            kernel_size=kernel_size, dilation=dilation,
+            padding=padding, bias=False
         )
         self.bn2 = nn.BatchNorm1d(out_channels)
-        self.downsample = downsample
+        self.drop2 = nn.Dropout(dropout)
+
+        self.downsample = None
+        if in_channels != out_channels:
+            self.downsample = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm1d(out_channels),
+            )
+
+        self.relu_out = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        identity = x
-
         out = self.conv1(x)
         out = self.bn1(out)
-        out = self.relu(out)
+        out = self.relu1(out)
+        out = self.drop1(out)
 
         out = self.conv2(out)
         out = self.bn2(out)
+        out = self.drop2(out)
 
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
-        out += identity
-        out = self.relu(out)
-        return out
+        res = x if self.downsample is None else self.downsample(x)
+        out = out + res
+        return self.relu_out(out)
 
 
-class ResNet1DClassifier(nn.Module):
+class TCNClassifier(nn.Module):
     """
     Input from dataset: [B, T, C]
     internal conv:      [B, C, T]
@@ -192,80 +200,57 @@ class ResNet1DClassifier(nn.Module):
         self,
         num_classes: int,
         input_channels: int = 5,
-        layers=(2, 2, 2, 2),
-        base_channels: int = 32,
-        stem_kernel_size: int = 7,
-        block_kernel_size: int = 3,
+        channels=(64, 64, 128, 128, 128, 128),
+        kernel_size: int = 5,
         dropout: float = 0.2,
+        downsample_factor: int = 4,
+        pool_type: str = "avg",
     ):
         super().__init__()
-        if len(layers) != 4:
-            raise ValueError("layers must have 4 elements, e.g. (2,2,2,2)")
+        if downsample_factor > 1:
+            if pool_type == "avg":
+                self.pool = nn.AvgPool1d(downsample_factor, downsample_factor)
+            elif pool_type == "max":
+                self.pool = nn.MaxPool1d(downsample_factor, downsample_factor)
+            else:
+                raise ValueError("pool_type must be 'avg' or 'max'")
+        else:
+            self.pool = None
 
-        self.in_channels = base_channels
-        self.conv1 = nn.Conv1d(
-            input_channels, base_channels,
-            kernel_size=stem_kernel_size, stride=2,
-            padding=stem_kernel_size // 2, bias=False
-        )
-        self.bn1 = nn.BatchNorm1d(base_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
-
-        self.layer1 = self._make_layer(base_channels, layers[0], block_kernel_size, stride=1)
-        self.layer2 = self._make_layer(base_channels * 2, layers[1], block_kernel_size, stride=2)
-        self.layer3 = self._make_layer(base_channels * 4, layers[2], block_kernel_size, stride=2)
-        self.layer4 = self._make_layer(base_channels * 8, layers[3], block_kernel_size, stride=2)
+        blocks = []
+        in_ch = input_channels
+        for i, out_ch in enumerate(channels):
+            dilation = 2 ** i
+            blocks.append(TemporalBlock(in_ch, out_ch, kernel_size, dilation, dropout))
+            in_ch = out_ch
+        self.network = nn.Sequential(*blocks)
 
         self.gap = nn.AdaptiveAvgPool1d(1)
-        self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(base_channels * 8, num_classes)
-
-    def _make_layer(self, out_channels, blocks, kernel_size, stride):
-        downsample = None
-        if stride != 1 or self.in_channels != out_channels:
-            downsample = nn.Sequential(
-                nn.Conv1d(self.in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm1d(out_channels),
-            )
-
-        layers = []
-        layers.append(BasicBlock1D(self.in_channels, out_channels, kernel_size, stride, downsample))
-        self.in_channels = out_channels
-        for _ in range(1, blocks):
-            layers.append(BasicBlock1D(self.in_channels, out_channels, kernel_size, stride=1))
-        return nn.Sequential(*layers)
+        self.fc = nn.Linear(in_ch, num_classes)
 
     def forward(self, x):
         # x: [B, T, C] -> [B, C, T]
         x = x.transpose(1, 2)
 
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
+        if self.pool is not None:
+            x = self.pool(x)
 
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-
+        x = self.network(x)
         x = self.gap(x).squeeze(-1)
-        x = self.dropout(x)
         return self.fc(x)
 
 
-def train_resnet1d_file_split_70_30(
+def train_tcn_file_split_70_30(
     classes,
     batch_size=32,
     epochs=60,
     learning_rate=3e-4,
 
-    layers=(2, 2, 2, 2),
-    base_channels=32,
-    stem_kernel_size=7,
-    block_kernel_size=3,
+    channels=(64, 64, 128, 128, 128, 128),
+    kernel_size=5,
     dropout=0.2,
+    downsample_factor=4,
+    pool_type="avg",
 
     weight_decay=1e-4,
     num_workers=4,
@@ -289,7 +274,7 @@ def train_resnet1d_file_split_70_30(
     # Versioned output (no overwrite)
     # -------------------------
     run_dir, version = make_versioned_run_dir(HISTORY_DIR, prefix="v")
-    ckpt_path = os.path.join(run_dir, f"resnet1d_z24_file_70_30_best_{version}.pt")
+    ckpt_path = os.path.join(run_dir, f"tcn_z24_file_70_30_best_{version}.pt")
     print(f"[RUN] output_dir={run_dir}")
     print(f"[RUN] ckpt_path={ckpt_path}")
 
@@ -330,11 +315,11 @@ def train_resnet1d_file_split_70_30(
         "batch_size": batch_size,
         "epochs": epochs,
         "learning_rate": learning_rate,
-        "layers": list(layers),
-        "base_channels": base_channels,
-        "stem_kernel_size": stem_kernel_size,
-        "block_kernel_size": block_kernel_size,
+        "channels": list(channels),
+        "kernel_size": kernel_size,
         "dropout": dropout,
+        "downsample_factor": downsample_factor,
+        "pool_type": pool_type,
         "weight_decay": weight_decay,
         "num_workers": num_workers,
         "split_seed": SPLIT_SEED,
@@ -357,14 +342,14 @@ def train_resnet1d_file_split_70_30(
     with open(os.path.join(run_dir, f"run_info_{version}.json"), "w", encoding="utf-8") as f:
         json.dump(run_info, f, ensure_ascii=False, indent=2)
 
-    model = ResNet1DClassifier(
+    model = TCNClassifier(
         num_classes=num_classes,
         input_channels=cfg.channels,
-        layers=layers,
-        base_channels=base_channels,
-        stem_kernel_size=stem_kernel_size,
-        block_kernel_size=block_kernel_size,
+        channels=channels,
+        kernel_size=kernel_size,
         dropout=dropout,
+        downsample_factor=downsample_factor,
+        pool_type=pool_type,
     ).to(device)
 
     print(model)
@@ -455,12 +440,12 @@ def train_resnet1d_file_split_70_30(
                     "best_epoch": best_epoch,
                     "best_val_loss": best_val_loss,
                     "history": history,
-                    "resnet1d_params": {
-                        "layers": list(layers),
-                        "base_channels": base_channels,
-                        "stem_kernel_size": stem_kernel_size,
-                        "block_kernel_size": block_kernel_size,
+                    "tcn_params": {
+                        "channels": list(channels),
+                        "kernel_size": kernel_size,
                         "dropout": dropout,
+                        "downsample_factor": downsample_factor,
+                        "pool_type": pool_type,
                         "weight_decay": weight_decay,
                     },
                 },
@@ -470,18 +455,18 @@ def train_resnet1d_file_split_70_30(
 
         scheduler.step(val_loss)
 
-    with open(os.path.join(run_dir, f"resnet1d_z24_file_70_30_history_{version}.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(run_dir, f"tcn_z24_file_70_30_history_{version}.json"), "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
-    plot_history(history, os.path.join(run_dir, f"resnet1d_z24_file_70_30_curves_{version}.png"))
+    plot_history(history, os.path.join(run_dir, f"tcn_z24_file_70_30_curves_{version}.png"))
 
     if last_val_true is not None and last_val_pred is not None:
         plot_confusion_matrix(
             last_val_true,
             last_val_pred,
             num_classes,
-            os.path.join(run_dir, f"resnet1d_z24_file_70_30_val_cm_{version}.png"),
-            title=f"VAL Confusion Matrix (ResNet1D 70/30 file split) - {version}",
+            os.path.join(run_dir, f"tcn_z24_file_70_30_val_cm_{version}.png"),
+            title=f"VAL Confusion Matrix (TCN 70/30 file split) - {version}",
         )
 
     print(f"[DONE] best_epoch={best_epoch}, best_val_loss={best_val_loss:.4f}")
@@ -490,17 +475,17 @@ def train_resnet1d_file_split_70_30(
 
 
 if __name__ == "__main__":
-    train_resnet1d_file_split_70_30(
+    train_tcn_file_split_70_30(
         classes=['01', '03', '04', '05', '06'],
         batch_size=32,
         epochs=50,
         learning_rate=3e-4,
 
-        layers=(2, 2, 2, 2),
-        base_channels=32,
-        stem_kernel_size=7,
-        block_kernel_size=3,
+        channels=(64, 64, 128, 128, 128, 128),
+        kernel_size=5,
         dropout=0.3,
+        downsample_factor=4,
+        pool_type="avg",
 
         weight_decay=1e-4,
         num_workers=4,
