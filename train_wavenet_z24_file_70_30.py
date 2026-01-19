@@ -1,4 +1,4 @@
-# train_wavenet_z24_file_70_30_paper_aug.py
+# train_wavenet_z24_file_70_30.py
 import os
 os.environ["PYTHONHASHSEED"] = "4"
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
