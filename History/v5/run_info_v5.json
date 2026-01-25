@@ -1,0 +1,56 @@
+{
+  "version": "v5",
+  "classes": [
+    "01",
+    "03",
+    "04",
+    "05",
+    "06"
+  ],
+  "batch_size": 32,
+  "epochs": 50,
+  "learning_rate": 0.0003,
+  "conv_channels": [
+    32,
+    64,
+    128
+  ],
+  "kernel_sizes": [
+    7,
+    5,
+    3
+  ],
+  "strides": [
+    2,
+    2,
+    2
+  ],
+  "conv_dropout": 0.1,
+  "gru_hidden": 128,
+  "gru_layers": 1,
+  "bidirectional": true,
+  "gru_dropout": 0.0,
+  "fc_dropout": 0.3,
+  "weight_decay": 0.0001,
+  "num_workers": 4,
+  "split_seed": 42,
+  "global_seed": 4,
+  "dataset": {
+    "root": "./DatasetPDT",
+    "subdir": "avt/Processed",
+    "key": "data_last5",
+    "end_t": 64000,
+    "window": 2048,
+    "no_overlap": true,
+    "augmentation": {
+      "offline_index_expansion": true,
+      "noise_ks": [
+        0.03,
+        0.05,
+        0.07
+      ],
+      "reverse": true,
+      "val_clean_only": true
+    }
+  }
+}

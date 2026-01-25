@@ -1,0 +1,45 @@
+{
+  "version": "v6",
+  "classes": [
+    "01",
+    "03",
+    "04",
+    "05",
+    "06"
+  ],
+  "batch_size": 32,
+  "epochs": 50,
+  "learning_rate": 0.0003,
+  "layers": [
+    2,
+    2,
+    2,
+    2
+  ],
+  "base_channels": 32,
+  "stem_kernel_size": 7,
+  "block_kernel_size": 3,
+  "dropout": 0.3,
+  "weight_decay": 0.0001,
+  "num_workers": 4,
+  "split_seed": 42,
+  "global_seed": 4,
+  "dataset": {
+    "root": "./DatasetPDT",
+    "subdir": "avt/Processed",
+    "key": "data_last5",
+    "end_t": 64000,
+    "window": 2048,
+    "no_overlap": true,
+    "augmentation": {
+      "offline_index_expansion": true,
+      "noise_ks": [
+        0.03,
+        0.05,
+        0.07
+      ],
+      "reverse": true,
+      "val_clean_only": true
+    }
+  }
+}
