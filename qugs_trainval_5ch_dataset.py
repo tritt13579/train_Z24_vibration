@@ -116,7 +116,7 @@ def _class_sort_key(cls: str):
 
 
 def _build_label_map(train_files: List[str], val_files: List[str]) -> Dict[str, int]:
-    classes = sorted({*_extract_class_name(fp) for fp in train_files + val_files}, key=_class_sort_key)
+    classes = sorted({_extract_class_name(fp) for fp in train_files + val_files}, key=_class_sort_key)
     return {cls: i for i, cls in enumerate(classes)}
 
 
