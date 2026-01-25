@@ -10,7 +10,7 @@ import torch
 from torch import nn
 import matplotlib.pyplot as plt
 
-from z24_file_split_70_30 import Z24Cfg, make_loaders
+from z24_file_split_70_30_on_the_fly import Z24Cfg, make_loaders
 
 
 # =========================
@@ -476,15 +476,15 @@ def train_tcn_file_split_70_30(
 
 if __name__ == "__main__":
     train_tcn_file_split_70_30(
-        classes=['01', '03', '04', '05', '06'],
+        classes=['01', '04', '05', '06', '07'],
         batch_size=32,
         epochs=50,
-        learning_rate=3e-4,
+        learning_rate=5e-4,
 
         channels=(64, 64, 128, 128, 128, 128),
         kernel_size=5,
         dropout=0.3,
-        downsample_factor=4,
+        downsample_factor=1,
         pool_type="avg",
 
         weight_decay=1e-4,

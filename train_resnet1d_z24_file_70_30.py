@@ -10,7 +10,7 @@ import torch
 from torch import nn
 import matplotlib.pyplot as plt
 
-from z24_file_split_70_30 import Z24Cfg, make_loaders
+from z24_file_split_70_30_on_the_fly import Z24Cfg, make_loaders
 
 
 # =========================
@@ -494,7 +494,7 @@ if __name__ == "__main__":
         classes=['01', '03', '04', '05', '06'],
         batch_size=32,
         epochs=50,
-        learning_rate=3e-4,
+        learning_rate=5e-4,
 
         layers=(2, 2, 2, 2),
         base_channels=32,

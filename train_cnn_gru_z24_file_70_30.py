@@ -10,7 +10,7 @@ import torch
 from torch import nn
 import matplotlib.pyplot as plt
 
-from z24_file_split_70_30 import Z24Cfg, make_loaders
+from z24_file_split_70_30_on_the_fly import Z24Cfg, make_loaders
 
 
 # =========================
@@ -484,7 +484,7 @@ if __name__ == "__main__":
         classes=['01', '03', '04', '05', '06'],
         batch_size=32,
         epochs=50,
-        learning_rate=3e-4,
+        learning_rate=5e-4,
 
         conv_channels=(32, 64, 128),
         kernel_sizes=(7, 5, 3),
@@ -494,7 +494,7 @@ if __name__ == "__main__":
         gru_hidden=128,
         gru_layers=1,
         bidirectional=True,
-        gru_dropout=0.0,
+        gru_dropout=0.1,
 
         fc_dropout=0.3,
         weight_decay=1e-4,
